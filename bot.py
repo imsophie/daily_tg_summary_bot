@@ -208,7 +208,7 @@ async def cmd_summary(message: Message):
     await message.answer("Собираю сводку за последние 24 часа по этому разделу...")
     messages = get_messages_last_24h(message.chat.id, thread_id)
     summary = await generate_summary(messages)
-    await message.answer(summary, message_thread_id=thread_id)
+    await message.answer(summary)
 
 
 @dp.message(F.text)
