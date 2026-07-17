@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
@@ -22,7 +23,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 # ---------- Настройки ----------
@@ -45,7 +46,21 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-claude = Anthropic(api_key=ANTHROPIC_API_KEY)
+claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# Сколько секунд максимум ждать ответ от Claude API, прежде чем сдаться
+CLAUDE_TIMEOUT_SECONDS = 60
+
+# Максимальное число сообщений, которое отправляем в одном запросе на саммари
+# (защита от слишком больших/медленных запросов при очень активных чатах)
+MAX_MESSAGES_FOR_SUMMARY = 1500
+
+# Минимальный перерыв между вызовами /summary в одном разделе (в секундах).
+# Если команду вызвали повторно раньше — бот молча игнорирует вызов, без сообщений.
+SUMMARY_COOLDOWN_SECONDS = 5 * 60  # 5 минут
+
+# Хранит время последнего успешного запуска /summary для каждой пары (чат, раздел)
+_last_summary_call: dict[tuple[int, int | None], float] = {}
 
 
 # ---------- База данных ----------
@@ -122,16 +137,33 @@ def build_summary_prompt(messages: list[tuple[str, str]]) -> str:
     )
 
 
-def generate_summary(messages: list[tuple[str, str]]) -> str:
+async def generate_summary(messages: list[tuple[str, str]]) -> str:
     if not messages:
         return "За последние сутки сообщений не было."
 
+    # Если сообщений очень много — берём только последние N, чтобы не упереться
+    # в лимиты API и не ждать ответ слишком долго
+    if len(messages) > MAX_MESSAGES_FOR_SUMMARY:
+        messages = messages[-MAX_MESSAGES_FOR_SUMMARY:]
+
     prompt = build_summary_prompt(messages)
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}],
-    )
+
+    try:
+        response = await asyncio.wait_for(
+            claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            timeout=CLAUDE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Claude API не ответил за %s секунд", CLAUDE_TIMEOUT_SECONDS)
+        return "Не получилось собрать сводку — сервер долго не отвечал. Попробуйте ещё раз чуть позже."
+    except Exception as e:
+        logger.error("Ошибка при обращении к Claude API: %s", e)
+        return "Не получилось собрать сводку — произошла ошибка при обращении к Claude API."
+
     return response.content[0].text
 
 
@@ -164,9 +196,18 @@ async def cmd_summary(message: Message):
         return
 
     thread_id = message.message_thread_id  # None, если раздел (тема) не используется
+
+    # Проверка отката: если команду вызывали недавно в этом же разделе — молча игнорируем
+    key = (message.chat.id, thread_id)
+    now = time.monotonic()
+    last_call = _last_summary_call.get(key)
+    if last_call is not None and (now - last_call) < SUMMARY_COOLDOWN_SECONDS:
+        return
+    _last_summary_call[key] = now
+
     await message.answer("Собираю сводку за последние 24 часа по этому разделу...")
     messages = get_messages_last_24h(message.chat.id, thread_id)
-    summary = generate_summary(messages)
+    summary = await generate_summary(messages)
     await message.answer(summary, message_thread_id=thread_id)
 
 
@@ -196,7 +237,7 @@ async def send_daily_summary(chat_id: int):
     thread_ids = get_active_threads_last_24h(chat_id)
     for thread_id in thread_ids:
         messages = get_messages_last_24h(chat_id, thread_id)
-        summary = generate_summary(messages)
+        summary = await generate_summary(messages)
         await bot.send_message(
             chat_id,
             f"📋 Сводка за сутки:\n\n{summary}",
