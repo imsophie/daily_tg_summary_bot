@@ -1,0 +1,4 @@
+aiogram>=3.13
+apscheduler>=3.10
+anthropic>=0.39
+python-dotenv>=1.0
